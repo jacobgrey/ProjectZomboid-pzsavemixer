@@ -32,6 +32,13 @@ def dedicated_db_dir() -> Path:
     return zomboid_root() / "db"
 
 
+def characters_dir() -> Path:
+    """User-facing collection of exported .pzchar files. Created on demand."""
+    d = zomboid_root() / "Characters"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
 def iter_sp_save_dirs() -> Iterable[tuple[str, Path]]:
     """Yield (mode, save_dir) for each SP save folder."""
     root = saves_root()

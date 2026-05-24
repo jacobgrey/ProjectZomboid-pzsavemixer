@@ -10,9 +10,9 @@ from pathlib import Path
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from pzmix import paths, saves as save_mod, compat, compose, backup, ui, steam
+from pzmix import paths, saves as save_mod, compat, compose, backup, ui, steam, pzchar
 from pzmix.ui import (
-    MenuItem, menu, header, hr, pause, clear, prompt_text, confirm,
+    MenuItem, menu, multi_menu, header, hr, pause, clear, prompt_text, confirm,
     typed_confirm, tag_for_kind, fmt_wv,
     SENTINEL_BACK, SENTINEL_QUIT, SENTINEL_REFRESH,
     HEAD, ACCENT, OK, WARN, BAD, MUTED, RESET, DIM, BOLD,
@@ -92,6 +92,9 @@ def main_menu() -> None:
             MenuItem("Mix and export",
                      hint="pick a world + a character → new save",
                      value="mix"),
+            MenuItem("Characters (portable .pzchar files)",
+                     hint=f"export to / list ~/Zomboid/Characters/ for sharing & re-import",
+                     value="chars"),
             MenuItem("Backup & restore",
                      hint="archive existing saves; restore as new (or overwrite)",
                      value="backup"),
@@ -110,6 +113,8 @@ def main_menu() -> None:
             browse_menu()
         elif ans == "mix":
             mix_flow()
+        elif ans == "chars":
+            characters_menu()
         elif ans == "backup":
             backup_menu()
         elif ans == "settings":
@@ -190,7 +195,12 @@ def print_character(c: Character, s: Save) -> None:
 # ---------- mix flow ----------
 
 def mix_flow() -> None:
-    """Pick world → pick character → pick target mode → name → confirm → export."""
+    """Pick world → pick target mode → pick character(s) → name → confirm → export.
+
+    For MP targets, characters can be picked from any existing save OR from
+    .pzchar files in ~/Zomboid/Characters/ (multi-select). SP targets accept
+    at most one character.
+    """
     # 1. World
     world_items = [_save_item(s) for s in STATE.saves]
     world = menu(["Main", "Mix", "1/5  pick world"], world_items,
@@ -199,28 +209,7 @@ def mix_flow() -> None:
     if not isinstance(world, Save):
         return
 
-    # 2. Character (from any save)
-    char_items: list[MenuItem] = []
-    for s in STATE.saves:
-        for c in s.characters:
-            char_items.append(_char_item(c, s))
-    char_items.append(MenuItem(
-        f"{MUTED}— empty world (no character) —{RESET}",
-        value=("NONE", None), hint="export the world by itself"))
-    pick = menu(["Main", "Mix", "2/5  pick character"], char_items,
-                prompt="character",
-                empty_msg="no characters across any saves")
-    if pick is SENTINEL_BACK or pick is SENTINEL_QUIT:
-        return
-    if pick == ("NONE", None):
-        chosen_char = None
-        char_source = None
-    elif isinstance(pick, tuple):
-        chosen_char, char_source = pick
-    else:
-        return
-
-    # 3. Target mode
+    # 2. Target mode (determines whether character selection is single or multi)
     mode_items = [
         MenuItem("SP — Sandbox",     value=("SP", "Sandbox")),
         MenuItem("SP — Apocalypse",  value=("SP", "Apocalypse")),
@@ -229,62 +218,125 @@ def mix_flow() -> None:
         MenuItem("MP — Hosted (self-host)", value=("MP", "Multiplayer"),
                  hint="creates Saves/Multiplayer/<name> + _player + Server/<name>.ini"),
     ]
-    mode_pick = menu(["Main", "Mix", "3/5  target mode"], mode_items,
+    mode_pick = menu(["Main", "Mix", "2/5  target mode"], mode_items,
                      prompt="mode")
     if not isinstance(mode_pick, tuple):
         return
     target_kind, target_mode = mode_pick
 
-    # 4. Name + steamid (MP)
+    # 3. Character(s) — pool of saves + .pzchar files
+    pool_items, pool_specs = _build_character_pool()
+    is_mp = (target_kind == SAVE_KIND_MP)
+    if is_mp:
+        # Empty selection is permitted (export world only).
+        picked = multi_menu(
+            ["Main", "Mix", "3/5  pick character(s)"],
+            pool_items,
+            prompt="toggle",
+            status=f"{MUTED}pick zero or more — for group play, select each "
+                   f"joining player's character{RESET}",
+            empty_msg="no characters or .pzchar files found",
+        )
+        if picked in (SENTINEL_BACK, SENTINEL_QUIT):
+            return
+        picked_indices = list(picked) if isinstance(picked, list) else []
+    else:
+        # SP: single-select, with an explicit "no character" option.
+        sp_items = list(pool_items) + [MenuItem(
+            f"{MUTED}— empty world (no character) —{RESET}",
+            value="NONE", hint="export the world by itself")]
+        single = menu(["Main", "Mix", "3/5  pick character"], sp_items,
+                      prompt="character",
+                      empty_msg="no characters or .pzchar files found")
+        if single in (SENTINEL_BACK, SENTINEL_QUIT):
+            return
+        if single == "NONE":
+            picked_indices = []
+        elif isinstance(single, int):
+            picked_indices = [single]
+        else:
+            return
+
+    chosen_specs = [pool_specs[i] for i in picked_indices]
+
+    # 4. Name (always) + default MP creds (only needed if any chosen char lacks them)
     suggested = f"{world.name}_mix"
     name = prompt_text("new save name", default=suggested)
     if not name:
         return
     plan = compose.ExportPlan(
         target_kind=target_kind, target_mode=target_mode, target_name=name,
-        source_world=world, source_character=chosen_char,
-        character_source_save=char_source,
+        source_world=world, characters=chosen_specs,
     )
-    if target_kind == SAVE_KIND_MP:
-        # Detect the currently-logged-in Steam account on this machine so
-        # the defaults are correct out of the box.
-        local_user = steam.find_current_user()
 
-        # Username default: prefer the source character's existing one (so
-        # MP→MP rename preserves it), otherwise fall back to the local
-        # Steam AccountName, otherwise a placeholder.
-        if chosen_char and chosen_char.username:
-            default_user = chosen_char.username
-        elif local_user and local_user.account_name:
-            default_user = local_user.account_name
-        else:
-            default_user = "Player1"
-
-        # Steamid default: same priority — existing > local Steam > "0".
-        if chosen_char and chosen_char.steamid:
-            default_sid = chosen_char.steamid
-        elif local_user:
-            default_sid = local_user.steamid64
-        else:
-            default_sid = "0"
-
-        if local_user:
-            print(f"  {MUTED}detected local Steam user: "
-                  f"{local_user.persona_name or local_user.account_name} "
-                  f"({local_user.steamid64}){RESET}")
-
-        plan.target_username = prompt_text("MP username for this character",
-                                           default=default_user)
-        plan.target_steamid = prompt_text(
-            "steamid (numeric, no quotes — use 0 for non-Steam)",
-            default=default_sid)
+    if is_mp:
         # Map= for MP source: copy from the existing server INI.
-        # For SP source: the base PZ map "Muldraugh, KY" is correct unless
-        # the user has a custom map mod installed (rare). We don't prompt —
-        # the confirm screen tells them how to override if needed.
+        # For SP source: stock Muldraugh KY (user can edit INI for a map mod).
         plan.target_map = world.map_value or "Muldraugh, KY"
 
+        # Default creds only matter for characters that don't carry their own.
+        chars_needing_creds = [s for s in chosen_specs
+                               if not s.character.steamid]
+        if chars_needing_creds:
+            local_user = steam.find_current_user()
+            if local_user:
+                print(f"  {MUTED}detected local Steam user: "
+                      f"{local_user.persona_name or local_user.account_name} "
+                      f"({local_user.steamid64}){RESET}")
+            print(f"  {MUTED}{len(chars_needing_creds)} character(s) need "
+                  f"MP credentials (no .pzchar / MP-source data bundled). "
+                  f"These defaults apply to every such character.{RESET}")
+            default_user = (local_user.account_name if local_user else "Player1")
+            default_sid = (local_user.steamid64 if local_user else "0")
+            plan.default_username = prompt_text(
+                "default MP username", default=default_user)
+            plan.default_steamid = prompt_text(
+                "default steamid (numeric, no quotes)", default=default_sid)
+
     confirm_export(plan)
+
+
+def _build_character_pool() -> tuple[list[MenuItem], list[compose.CharacterSpec]]:
+    """Aggregate every selectable character from discovered saves + every
+    .pzchar file under ~/Zomboid/Characters/. Returns parallel lists where
+    MenuItem.value is the index into the spec list."""
+    items: list[MenuItem] = []
+    specs: list[compose.CharacterSpec] = []
+
+    # From saves
+    for s in STATE.saves:
+        for c in s.characters:
+            specs.append(compose.CharacterSpec(
+                character=c, source_save=s,
+                source_label=f"{s.name} ({s.mode})"))
+            tag = "MP" if c.is_network else "SP"
+            dead = f" {BAD}[DEAD]{RESET}" if c.is_dead else ""
+            user = f" {DIM}user={c.username}{RESET}" if c.username else ""
+            items.append(MenuItem(
+                label=c.name,
+                hint=f"from {s.name} ({s.mode}) {c.short_coords} "
+                     f"{fmt_wv(c.worldversion)}{user}{dead}",
+                value=len(specs) - 1,
+                tag=tag,
+            ))
+
+    # From .pzchar files
+    for pzf in pzchar.list_pzchar_files(paths.characters_dir()):
+        ch = pzf.to_character()
+        specs.append(compose.CharacterSpec(
+            character=ch, source_save=None,
+            source_label=f".pzchar: {pzf.path.name}"))
+        cred_hint = (f"creds={pzf.mp_username}/{pzf.mp_steamid}"
+                     if pzf.has_mp_creds else f"{WARN}no MP creds{RESET}")
+        dead = f" {BAD}[DEAD]{RESET}" if pzf.is_dead else ""
+        items.append(MenuItem(
+            label=pzf.name,
+            hint=f"{pzf.path.name}  src={pzf.source_save} "
+                 f"{fmt_wv(pzf.worldversion)}  {cred_hint}{dead}",
+            value=len(specs) - 1,
+            tag="PZ",
+        ))
+    return items, specs
 
 
 def confirm_export(plan: compose.ExportPlan) -> None:
@@ -303,15 +355,27 @@ def confirm_export(plan: compose.ExportPlan) -> None:
         if plan.source_world.is_mp_client_cache:
             print(f"             {WARN}! client cache only — no server config; "
                   f"world may be incomplete{RESET}")
-        if plan.source_character:
-            c = plan.source_character
-            print(f"    char   : {c.name} {c.short_coords} {fmt_wv(c.worldversion)}"
-                  f"{(' (DEAD)' if c.is_dead else '')}")
+        if plan.characters:
+            print(f"    chars  : {len(plan.characters)}")
+            for spec in plan.characters:
+                c = spec.character
+                dead = f" {BAD}(DEAD){RESET}" if c.is_dead else ""
+                # Effective credentials for MP display.
+                eff_user = c.username or plan.default_username or ""
+                eff_sid = c.steamid or plan.default_steamid or ""
+                if plan.target_kind == SAVE_KIND_MP:
+                    cred = f"  user={eff_user} sid={eff_sid}"
+                    cred_src = (MUTED + "(own)" + RESET if c.steamid
+                                else WARN + "(default)" + RESET)
+                    cred = f"  {eff_user}/{eff_sid} {cred_src}"
+                else:
+                    cred = ""
+                print(f"      - {c.name} {c.short_coords} "
+                      f"{fmt_wv(c.worldversion)}{dead}{cred}")
+                print(f"        {MUTED}from {spec.source_label}{RESET}")
         else:
-            print(f"    char   : {MUTED}(none — world only){RESET}")
+            print(f"    chars  : {MUTED}(none — world only){RESET}")
         if plan.target_kind == SAVE_KIND_MP:
-            print(f"    MP     : username={plan.target_username} "
-                  f"steamid={plan.target_steamid}")
             map_src = (f"copied from source INI" if plan.source_world.kind == SAVE_KIND_MP
                        else f"default — edit Server\\{plan.target_name}.ini if "
                             f"you have a map mod")
@@ -353,11 +417,17 @@ def confirm_export(plan: compose.ExportPlan) -> None:
             print(f"    mods   : {MUTED}(none){RESET}")
         print()
 
-        if plan.source_character and plan.character_source_save:
-            rep = compat.compare(plan.source_character,
-                                 plan.character_source_save,
+        # Per-character compatibility diffs (only when we have a source save
+        # to diff against; .pzchar sources may not carry one).
+        for spec in plan.characters:
+            if spec.source_save is None:
+                continue
+            rep = compat.compare(spec.character, spec.source_save,
                                  plan.source_world)
-            _print_compat(rep)
+            if rep.has_warnings:
+                print(f"\n  {HEAD}{spec.character.name}{RESET} "
+                      f"{MUTED}({spec.source_label}){RESET}")
+                _print_compat(rep)
 
         errs = compose.precheck(plan)
         if errs:
@@ -475,6 +545,146 @@ def _render_progress(stage: str, copied: int, total: int) -> None:
         line = f"  {ACCENT}{label}{RESET} {spin}"
     sys.stdout.write("\r" + line + " " * 6)
     sys.stdout.flush()
+
+
+# ---------- characters menu ----------
+
+def characters_menu() -> None:
+    while True:
+        chars_dir = paths.characters_dir()
+        existing = pzchar.list_pzchar_files(chars_dir)
+        info = f"  {MUTED}.pzchar storage:{RESET} {chars_dir}  " \
+               f"{MUTED}({len(existing)} file(s)){RESET}"
+        items = [
+            MenuItem("Export a character to .pzchar",
+                     hint="pick a character from any save → portable file",
+                     value="export"),
+            MenuItem("List / manage existing .pzchar files",
+                     hint="show details, delete",
+                     value="list"),
+        ]
+        ans = menu(["Main", "Characters"], items, status=info)
+        if ans in (SENTINEL_BACK, SENTINEL_QUIT):
+            return
+        if ans == "export":
+            export_character_flow()
+        elif ans == "list":
+            list_pzchar_flow()
+
+
+def export_character_flow() -> None:
+    """Pick one character from any save and write it to ~/Zomboid/Characters/."""
+    items: list[MenuItem] = []
+    pairs: list[tuple[Character, Save]] = []
+    for s in STATE.saves:
+        for c in s.characters:
+            pairs.append((c, s))
+            items.append(_char_item(c, s))
+    if not items:
+        print(f"  {MUTED}no characters found in any save.{RESET}"); pause(); return
+    pick = menu(["Main", "Characters", "export"], items,
+                prompt="character",
+                empty_msg="no characters found")
+    if not isinstance(pick, tuple) or not isinstance(pick[0], Character):
+        return
+    c, s = pick
+
+    # Suggest filename. User can override.
+    suggested = pzchar.suggested_filename(c, s.name)
+    filename = prompt_text("filename", default=suggested)
+    if not filename:
+        return
+    if not filename.lower().endswith(pzchar.PZCHAR_EXTENSION):
+        filename += pzchar.PZCHAR_EXTENSION
+    out = paths.characters_dir() / filename
+    if out.exists():
+        if not confirm(f"{out.name} already exists — overwrite?", default=False):
+            print(f"  {MUTED}cancelled.{RESET}"); pause(); return
+
+    note = prompt_text("optional note", default="", allow_empty=True)
+
+    # Steam auto-detect for SP characters so the file is MP-importable
+    # without any host-side prompts.
+    local_user = None
+    if not c.steamid:
+        local_user = steam.find_current_user()
+        if local_user:
+            print(f"  {MUTED}bundling local Steam credentials so the host "
+                  f"doesn't need to ask: "
+                  f"{local_user.account_name} / {local_user.steamid64}{RESET}")
+        else:
+            print(f"  {WARN}Steam not detected — this .pzchar will have no MP "
+                  f"credentials. Importing host will have to supply them.{RESET}")
+
+    try:
+        path = pzchar.export_character(
+            c, source_save_name=s.name, source_kind=s.kind,
+            source_mods=s.mods, source_map=s.map_value, output_path=out,
+            note=note or None, local_steam_user=local_user, overwrite=True,
+        )
+    except Exception as e:
+        print(f"  {BAD}export failed: {e}{RESET}"); pause(); return
+    print(f"\n  {OK}✓ wrote {path.name}{RESET}  {MUTED}({path.stat().st_size} bytes){RESET}")
+    print(f"    {MUTED}{path}{RESET}")
+    pause()
+
+
+def list_pzchar_flow() -> None:
+    while True:
+        chars_dir = paths.characters_dir()
+        records = pzchar.list_pzchar_files(chars_dir)
+        items = []
+        for r in records:
+            cred = (f"{r.mp_username}/{r.mp_steamid}" if r.has_mp_creds
+                    else f"{WARN}no MP creds{RESET}")
+            dead = f"  {BAD}[DEAD]{RESET}" if r.is_dead else ""
+            items.append(MenuItem(
+                label=r.display_label,
+                hint=f"{r.path.name}  src={r.source_save}  "
+                     f"{fmt_wv(r.worldversion)}  {cred}{dead}",
+                value=r,
+            ))
+        pick = menu(["Main", "Characters", "list"], items,
+                    empty_msg=f"no .pzchar files in {chars_dir}")
+        if pick in (SENTINEL_BACK, SENTINEL_QUIT):
+            return
+        if not isinstance(pick, pzchar.PZCharFile):
+            return
+        action = menu(
+            ["Main", "Characters", "list", pick.display_label],
+            [MenuItem("Show details", value="show"),
+             MenuItem("Delete this .pzchar", value="del")],
+        )
+        if action == "show":
+            print(); print(f"  {HEAD}{pick.name}{RESET}")
+            print(f"  {MUTED}path        : {RESET}{pick.path}")
+            print(f"  {MUTED}exported_at : {RESET}{pick.exported_at}")
+            print(f"  {MUTED}source      : {RESET}{pick.source_save} ({pick.source_kind})")
+            print(f"  {MUTED}worldver    : {RESET}{pick.worldversion}")
+            print(f"  {MUTED}blob_size   : {RESET}{pick.blob_size} bytes")
+            print(f"  {MUTED}is_dead     : {RESET}{pick.is_dead}")
+            print(f"  {MUTED}coords      : {RESET}{pick.coords}")
+            print(f"  {MUTED}MP user     : {RESET}{pick.mp_username}")
+            print(f"  {MUTED}MP steamid  : {RESET}{pick.mp_steamid}")
+            print(f"  {MUTED}source_map  : {RESET}{pick.source_map}")
+            print(f"  {MUTED}mods({len(pick.source_mods)}):{RESET}")
+            for m in pick.source_mods[:20]:
+                print(f"      - {m}")
+            if len(pick.source_mods) > 20:
+                print(f"      {MUTED}…and {len(pick.source_mods)-20} more{RESET}")
+            if pick.note:
+                print(f"  {MUTED}note        : {RESET}{pick.note}")
+            pause()
+        elif action == "del":
+            if typed_confirm("delete this .pzchar permanently",
+                             must_type=pick.path.name):
+                try:
+                    pick.path.unlink()
+                    print(f"  {OK}✓ deleted{RESET}"); pause()
+                except OSError as e:
+                    print(f"  {BAD}delete failed: {e}{RESET}"); pause()
+            else:
+                print(f"  {MUTED}aborted — text didn't match.{RESET}"); pause()
 
 
 # ---------- backup menu ----------

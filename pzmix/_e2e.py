@@ -62,7 +62,7 @@ if SAMPLE_SERVER_INI.is_file():
 # --- now import the tool ---
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from pzmix import paths, saves, compose, backup as backup_mod
-from pzmix.saves import SAVE_KIND_SP, SAVE_KIND_MP
+from pzmix.saves import SAVE_KIND_SP, SAVE_KIND_MP, Character
 
 
 def find(name: str, all_saves):
@@ -98,8 +98,9 @@ mp_char_alive = [c for c in mp.characters if not c.is_dead][0]
 plan = compose.ExportPlan(
     target_kind=SAVE_KIND_SP, target_mode="Sandbox",
     target_name="t1_sp2sp",
-    source_world=sp, source_character=sp_char,
-    character_source_save=sp,
+    source_world=sp,
+    characters=[compose.CharacterSpec(character=sp_char, source_save=sp,
+                                      source_label="sp_char")],
 )
 out = compose.execute(plan)
 assert_(out["world"].is_dir(), "target world dir created")
@@ -115,9 +116,10 @@ print("\n[2] SP world + SP char → new MP-host save")
 plan = compose.ExportPlan(
     target_kind=SAVE_KIND_MP, target_mode="Multiplayer",
     target_name="t2_sp2mp",
-    source_world=sp, source_character=sp_char,
-    character_source_save=sp,
-    target_username="Tester", target_steamid="76561111111111111",
+    source_world=sp,
+    characters=[compose.CharacterSpec(character=sp_char, source_save=sp,
+                                      source_label="sp_char")],
+    default_username="Tester", default_steamid="76561111111111111",
 )
 out = compose.execute(plan)
 assert_(out["world"].is_dir(), "MP world dir created")
@@ -165,8 +167,9 @@ print("\n[3] MP world + MP char → new SP save")
 plan = compose.ExportPlan(
     target_kind=SAVE_KIND_SP, target_mode="Sandbox",
     target_name="t3_mp2sp",
-    source_world=mp, source_character=mp_char_alive,
-    character_source_save=mp,
+    source_world=mp,
+    characters=[compose.CharacterSpec(character=mp_char_alive, source_save=mp,
+                                      source_label="mp_char_alive")],
 )
 out = compose.execute(plan)
 assert_(out["world"].is_dir(), "merged world dir created")
@@ -180,10 +183,11 @@ print("\n[4] MP world + MP char → new MP save (rename)")
 plan = compose.ExportPlan(
     target_kind=SAVE_KIND_MP, target_mode="Multiplayer",
     target_name="t4_mp2mp",
-    source_world=mp, source_character=mp_char_alive,
-    character_source_save=mp,
-    target_username=mp_char_alive.username or "Renamed",
-    target_steamid=mp_char_alive.steamid or "0",
+    source_world=mp,
+    characters=[compose.CharacterSpec(character=mp_char_alive, source_save=mp,
+                                      source_label="mp_char_alive")],
+    default_username=mp_char_alive.username or "Renamed",
+    default_steamid=mp_char_alive.steamid or "0",
 )
 out = compose.execute(plan)
 assert_(out["world"].is_dir(), "renamed MP world dir created")
@@ -201,8 +205,8 @@ print("\n[5] precheck refuses to clobber an existing target")
 plan = compose.ExportPlan(
     target_kind=SAVE_KIND_SP, target_mode="Sandbox",
     target_name="t1_sp2sp",  # already created in [1]
-    source_world=sp, source_character=sp_char,
-    character_source_save=sp,
+    source_world=sp,
+    characters=[compose.CharacterSpec(character=sp_char, source_save=sp)],
 )
 errs = compose.precheck(plan)
 assert_(any("already exists" in e for e in errs),
@@ -236,7 +240,8 @@ print("\n[7] target name validation")
 for bad in (" leading", "trailing ", "trailing.", "with*star", "CON", "nul", "x"*200):
     plan = compose.ExportPlan(
         target_kind=SAVE_KIND_SP, target_mode="Sandbox", target_name=bad,
-        source_world=sp, source_character=sp_char, character_source_save=sp,
+        source_world=sp,
+        characters=[compose.CharacterSpec(character=sp_char, source_save=sp)],
     )
     errs = compose.precheck(plan)
     assert_(bool(errs), f"name {bad!r} rejected by precheck")
@@ -251,9 +256,10 @@ mp_now = find("madland", saves_now)
 plan = compose.ExportPlan(
     target_kind=SAVE_KIND_MP, target_mode="Multiplayer",
     target_name="t8_strip_sid",
-    source_world=mp_now, source_character=mp_char_alive,
-    character_source_save=mp_now,
-    target_username="X", target_steamid="0",
+    source_world=mp_now,
+    characters=[compose.CharacterSpec(character=mp_char_alive,
+                                      source_save=mp_now)],
+    default_username="X", default_steamid="0",
 )
 out = compose.execute(plan)
 assert_(not (out["player"] / "serverid.dat").exists(),
@@ -289,12 +295,108 @@ print("\n[10] precheck refuses if destination would equal a source file/dir")
 plan = compose.ExportPlan(
     target_kind=SAVE_KIND_SP, target_mode="Sandbox",
     target_name=SAMPLE_SP.name,   # exactly the source save name
-    source_world=sp, source_character=sp_char, character_source_save=sp,
+    source_world=sp,
+    characters=[compose.CharacterSpec(character=sp_char, source_save=sp)],
 )
 errs = compose.precheck(plan)
 assert_(any("already exists" in e or "inside source" in e or "equals a source" in e
             for e in errs),
         "self-collision rejected")
+
+# ====== test 11: .pzchar round-trip ======
+print("\n[11] .pzchar export + reload round trip")
+from pzmix import pzchar
+char_path = tmp_root / "Characters" / "Mackenzie.pzchar"
+char_path.parent.mkdir(parents=True, exist_ok=True)
+pzchar.export_character(
+    sp_char, source_save_name=sp.name, source_kind=sp.kind,
+    source_mods=sp.mods, source_map=sp.map_value, output_path=char_path,
+    note="e2e",
+)
+assert_(char_path.is_file(), ".pzchar written")
+loaded = pzchar.load_pzchar(char_path)
+assert_(loaded.name == sp_char.name, "name round-trips")
+assert_(loaded.worldversion == sp_char.worldversion, "worldversion round-trips")
+assert_(loaded.blob_size == len(sp_char.data_blob), "blob_size matches")
+assert_(loaded.load_blob() == sp_char.data_blob, "blob bytes byte-identical")
+assert_(loaded.source_kind == "SP", "source_kind preserved")
+# An SP source has no MP creds; with no local_steam_user passed, manifest is SP-only.
+assert_(loaded.mp_steamid is None,
+        f"SP export without steam fallback has no MP creds, got {loaded.mp_steamid!r}")
+
+# ====== test 12: multi-character MP build with per-character creds ======
+print("\n[12] multi-character MP build (group of 3, mixed sources)")
+# Synthesize a second MP character with a DIFFERENT steamid so we exercise
+# the per-character credential path without colliding with the duplicate-
+# steamid guard.
+import copy as _copy
+alive2_data = _copy.copy(mp_char_alive)
+alive2_data.name = "Second Player"
+alive2_data.steamid = "76561111000000002"
+alive2_data.username = "SecondAccount"
+specs = [
+    compose.CharacterSpec(character=mp_char_alive, source_save=mp,
+                          source_label="alive1"),
+    compose.CharacterSpec(character=alive2_data, source_save=mp,
+                          source_label="alive2 (synthesized)"),
+    # Third is an SP-sourced character that needs default creds.
+    compose.CharacterSpec(character=sp_char, source_save=sp,
+                          source_label="sp_visitor"),
+]
+plan = compose.ExportPlan(
+    target_kind=SAVE_KIND_MP, target_mode="Multiplayer",
+    target_name="t12_group",
+    source_world=mp,
+    characters=specs,
+    default_username="VisitorAccount",
+    default_steamid="76561222222222222",
+)
+out = compose.execute(plan)
+rows = db_rows(out["world"] / "players.db", "networkPlayers")
+# steamids in MP rows: alive1 + alive2 (own creds) + sp_visitor (default).
+sids = [str(r[5]) for r in rows]
+unique_sids = set(sids)
+assert_(len(rows) == 3,
+        f"three networkPlayers rows inserted, got {len(rows)}")
+assert_(str(mp_char_alive.steamid) in unique_sids,
+        f"alive1's original steamid carried through, got {sids!r}")
+assert_("76561222222222222" in unique_sids,
+        f"SP visitor used the default steamid, got {sids!r}")
+
+# ====== test 13: SP target rejects multiple characters ======
+print("\n[13] SP target rejects multiple characters")
+plan = compose.ExportPlan(
+    target_kind=SAVE_KIND_SP, target_mode="Sandbox",
+    target_name="t13_multi_sp",
+    source_world=sp,
+    characters=[
+        compose.CharacterSpec(character=sp_char, source_save=sp),
+        compose.CharacterSpec(character=mp_char_alive, source_save=mp),
+    ],
+)
+errs = compose.precheck(plan)
+assert_(any("at most 1 character" in e for e in errs),
+        f"SP multi-char rejected, errs={errs}")
+
+# ====== test 14: duplicate steamid in MP build is rejected ======
+print("\n[14] duplicate steamid in one MP build is refused")
+plan = compose.ExportPlan(
+    target_kind=SAVE_KIND_MP, target_mode="Multiplayer",
+    target_name="t14_dup_steam",
+    source_world=mp,
+    characters=[
+        compose.CharacterSpec(character=mp_char_alive, source_save=mp),
+        # Reuse the same steamid for the second character.
+        compose.CharacterSpec(
+            character=Character(**{**mp_char_alive.__dict__,
+                                   "name": "Imposter",
+                                   "row_id": 999}),
+            source_save=mp),
+    ],
+)
+errs = compose.precheck(plan)
+assert_(any("share steamid" in e for e in errs),
+        f"duplicate steamid rejected, errs={errs}")
 
 print("\nALL E2E CHECKS PASSED")
 print(f"(temp dir kept for inspection: {tmp_root})")

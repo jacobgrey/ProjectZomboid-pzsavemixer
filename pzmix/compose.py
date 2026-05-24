@@ -13,7 +13,7 @@ import shutil
 import sqlite3
 import tempfile
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import paths
@@ -30,15 +30,35 @@ _HOST_CACHE_DIRS = ("apop", "chunkdata", "isoregiondata", "map", "metagrid", "zp
 
 
 @dataclass
+class CharacterSpec:
+    """One character to be inserted into the target save.
+
+    `character` carries blob/coords/name/worldversion and (for MP-sourced
+    characters and .pzchar files) the original username/steamid. `source_save`
+    is the Save the character came from, for compatibility diffing; it can
+    be None for characters loaded from .pzchar files.
+    """
+    character: Character
+    source_save: Save | None = None
+    source_label: str = ""
+
+    @property
+    def has_mp_creds(self) -> bool:
+        return bool(self.character.steamid)
+
+
+@dataclass
 class ExportPlan:
     target_kind: str            # SP / MP
     target_mode: str            # Apocalypse / Builder / Sandbox / Survivor / Multiplayer
     target_name: str            # folder/world name for the new save
     source_world: Save
-    source_character: Character | None
-    character_source_save: Save | None    # save the character came from (for mods)
-    target_steamid: str | None = None     # required when target_kind == MP
-    target_username: str | None = None    # MP only
+    characters: list[CharacterSpec] = field(default_factory=list)
+    # Fallback credentials applied to any character that lacks its own
+    # (e.g. an SP-sourced character being inserted into an MP target with
+    # no .pzchar-bundled credentials).
+    default_steamid: str | None = None
+    default_username: str | None = None
     target_map: str | None = None         # MP only — value for Server\<name>.ini Map=
 
 
@@ -141,10 +161,40 @@ def precheck(plan: ExportPlan) -> list[str]:
             except OSError:
                 pass
 
-    if plan.target_kind == SAVE_KIND_MP and not plan.target_steamid:
-        errors.append("MP export requires a steamid for the character")
-    if plan.target_kind == SAVE_KIND_MP and not plan.target_username:
-        errors.append("MP export requires a username for the character")
+    # MP target: every character must end up with a steamid + username,
+    # either its own or via the plan-level defaults.
+    if plan.target_kind == SAVE_KIND_MP:
+        for i, spec in enumerate(plan.characters, 1):
+            c = spec.character
+            sid = c.steamid or plan.default_steamid
+            uname = c.username or plan.default_username
+            if not sid:
+                errors.append(
+                    f"character #{i} ({c.name}): missing steamid for MP target")
+            if not uname:
+                errors.append(
+                    f"character #{i} ({c.name}): missing username for MP target")
+        # Detect duplicate steamids in this build — PZ keys players by
+        # steamid+username, so two characters with the same Steam ID would
+        # conflict when both players try to join.
+        seen_sids: dict[str, str] = {}
+        for i, spec in enumerate(plan.characters, 1):
+            sid = str(spec.character.steamid or plan.default_steamid or "").strip()
+            if not sid:
+                continue
+            if sid in seen_sids:
+                errors.append(
+                    f"two characters share steamid {sid}: "
+                    f"'{seen_sids[sid]}' and '{spec.character.name}' — "
+                    f"only one can be claimed by a given Steam account")
+            else:
+                seen_sids[sid] = spec.character.name
+
+    # SP target: only one character makes sense (PZ SP is single-player).
+    if plan.target_kind == SAVE_KIND_SP and len(plan.characters) > 1:
+        errors.append(
+            f"SP target accepts at most 1 character "
+            f"(received {len(plan.characters)})")
     return errors
 
 
@@ -215,7 +265,7 @@ def _build_sp(plan: ExportPlan, dests: dict[str, Path], *, file_cb=None) -> None
             _write_sp_mods_txt(dest_world / "mods.txt", src.mods)
 
     _rewrite_players_db(dest_world / "players.db",
-                        chars=[plan.source_character] if plan.source_character else [],
+                        specs=plan.characters,
                         as_network=False, plan=plan)
 
 
@@ -243,7 +293,7 @@ def _build_mp(plan: ExportPlan, dests: dict[str, Path], *, file_cb=None) -> None
         stale.unlink()
 
     _rewrite_players_db(dest_world / "players.db",
-                        chars=[plan.source_character] if plan.source_character else [],
+                        specs=plan.characters,
                         as_network=True, plan=plan)
 
 
@@ -344,9 +394,9 @@ def _copy_renamed_ini(src_ini: Path, dst_ini: Path, old_name: str, new_name: str
 
 # ---------- players.db rewrite ----------
 
-def _rewrite_players_db(db_path: Path, *, chars: list[Character | None],
+def _rewrite_players_db(db_path: Path, *, specs: list[CharacterSpec],
                         as_network: bool, plan: ExportPlan) -> None:
-    """Wipe & rebuild players.db with only the chosen character(s).
+    """Wipe & rebuild players.db with the chosen character(s).
 
     db_path points to the freshly-copied players.db inside the *new* save
     folder. We DROP+CREATE both tables to guarantee the current-build schema
@@ -371,11 +421,10 @@ def _rewrite_players_db(db_path: Path, *, chars: list[Character | None],
         con.execute("DROP TABLE IF EXISTS localPlayers")
         con.execute("DROP TABLE IF EXISTS networkPlayers")
         _ensure_player_tables(con)
-        for c in chars:
-            if c is None:
-                continue
+        for idx, spec in enumerate(specs):
+            c = spec.character
             if as_network:
-                _insert_network(con, c, plan)
+                _insert_network(con, c, plan, fallback_player_index=idx)
             else:
                 _insert_local(con, c, plan)
         con.commit()
@@ -426,22 +475,30 @@ def _insert_local(con: sqlite3.Connection, c: Character, plan: ExportPlan) -> No
     )
 
 
-def _insert_network(con: sqlite3.Connection, c: Character, plan: ExportPlan) -> None:
+def _insert_network(con: sqlite3.Connection, c: Character, plan: ExportPlan,
+                    *, fallback_player_index: int = 0) -> None:
     """MP convention: PZ stores networkPlayers string columns AS-IS — no
     surrounding apostrophes. The earlier code wrapped values in quotes, which
     broke steamid/username matching when joining a hosted MP world (PZ would
-    not find the row and prompt for a new character)."""
+    not find the row and prompt for a new character).
+
+    Username and steamid come from the character itself (MP source or
+    .pzchar with creds bundled) when available, falling back to the
+    plan-level defaults the user typed in the mix flow."""
     # Defensively strip any apostrophe wrap (e.g. if c was synthesised from an
     # SP source where _strip_quotes happened to miss it).
     name = c.name
     if name.startswith("'") and name.endswith("'") and len(name) >= 2:
         name = name[1:-1]
+    username = c.username or plan.default_username
+    steamid = c.steamid or plan.default_steamid
+    player_index = c.player_index if c.player_index is not None \
+        else fallback_player_index
     con.execute(
         "INSERT INTO networkPlayers "
         "(world,username,playerIndex,name,steamid,x,y,z,worldversion,data,isDead) "
         "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-        (plan.target_name, plan.target_username, c.player_index or 0, name,
-         plan.target_steamid,
+        (plan.target_name, username, player_index, name, steamid,
          c.x, c.y, c.z, c.worldversion, c.data_blob, int(c.is_dead)),
     )
 

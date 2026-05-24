@@ -199,6 +199,134 @@ def menu(
         pause()
 
 
+def multi_menu(
+    crumbs: list[str],
+    items: list[MenuItem],
+    *,
+    prompt: str = "toggle / done",
+    status: str | None = None,
+    allow_back: bool = True,
+    allow_quit: bool = True,
+    min_selected: int = 0,
+    max_selected: int | None = None,
+    empty_msg: str = "(nothing to pick from)",
+    initial: list[int] | None = None,
+) -> list[object] | object:
+    """Multi-select numbered menu. User types numbers (single, comma- or
+    space-separated, or ranges like '1-4') to toggle; types 'a' to select all,
+    'n' to clear, 'd' to confirm. Returns the selected values in original
+    order, or SENTINEL_BACK / SENTINEL_QUIT.
+
+    `max_selected` caps how many can be picked (e.g. 1 for SP target).
+    `min_selected` enforces at least N before 'd' is accepted.
+    """
+    selected: set[int] = set(initial or [])
+
+    def render_status_line() -> str:
+        n = len(selected)
+        if max_selected == 1:
+            return f"{n}/1 selected"
+        if max_selected is not None:
+            return f"{n}/{max_selected} selected"
+        if min_selected:
+            return f"{n} selected (≥{min_selected} required)"
+        return f"{n} selected"
+
+    while True:
+        clear()
+        header(crumbs)
+        banner_status(status)
+
+        if not items:
+            print(f"\n  {MUTED}{empty_msg}{RESET}\n")
+        else:
+            for i, it in enumerate(items, 1):
+                checked = (i - 1) in selected
+                mark = f"{OK}[X]{RESET}" if checked else f"{MUTED}[ ]{RESET}"
+                num = f"{ACCENT}{i:>3}{RESET}"
+                tag = f" {DIM}[{it.tag}]{RESET}" if it.tag else ""
+                color_label = it.label if not it.disabled \
+                    else f"{MUTED}{it.label}{RESET}"
+                print(f"  {num}. {mark}{tag} {color_label}")
+                if it.hint:
+                    print(f"           {MUTED}{it.hint}{RESET}")
+            print()
+            print(f"  {MUTED}{render_status_line()}{RESET}")
+
+        keys: list[tuple[str, str]] = [
+            ("a", "select all"),
+            ("n", "clear all"),
+            ("d", "done"),
+        ]
+        if allow_back: keys.append(("b", "back"))
+        if allow_quit: keys.append(("q", "quit"))
+        print("  " + "   ".join(f"{ACCENT}{k}{RESET} {MUTED}{lbl}{RESET}"
+                                for k, lbl in keys))
+        print(hr())
+
+        try:
+            raw = input(f"  {prompt} » ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            return SENTINEL_QUIT
+        if not raw:
+            continue
+        if raw == "q":
+            return SENTINEL_QUIT
+        if raw == "b" and allow_back:
+            return SENTINEL_BACK
+        if raw == "d":
+            if len(selected) < min_selected:
+                print(f"  {WARN}need at least {min_selected} selection(s).{RESET}")
+                pause()
+                continue
+            return [items[i].value for i in sorted(selected)]
+        if raw == "a":
+            if max_selected and max_selected < len(items):
+                selected = set(range(max_selected))
+            else:
+                selected = {i for i, it in enumerate(items) if not it.disabled}
+            continue
+        if raw == "n":
+            selected.clear()
+            continue
+
+        # Parse number tokens: comma- or space-separated, with ranges.
+        tokens = re.split(r"[,\s]+", raw)
+        bad = False
+        proposed = set(selected)
+        for tok in tokens:
+            if not tok:
+                continue
+            m = re.match(r"^(\d+)(?:-(\d+))?$", tok)
+            if not m:
+                bad = True; break
+            lo = int(m.group(1))
+            hi = int(m.group(2)) if m.group(2) else lo
+            if lo < 1 or hi > len(items) or lo > hi:
+                bad = True; break
+            for n in range(lo, hi + 1):
+                idx = n - 1
+                if items[idx].disabled:
+                    continue
+                if idx in proposed:
+                    proposed.discard(idx)
+                else:
+                    proposed.add(idx)
+        if bad:
+            print(f"  {BAD}? invalid selection: {raw!r}{RESET}")
+            pause()
+            continue
+        if max_selected is not None and len(proposed) > max_selected:
+            print(f"  {WARN}cap of {max_selected} reached — "
+                  f"deselect something first.{RESET}")
+            pause()
+            continue
+        selected = proposed
+
+
+import re  # noqa: E402  — used by multi_menu range parsing
+
+
 # -------- prompts --------
 
 def prompt_text(label: str, default: str | None = None,
