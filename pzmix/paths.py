@@ -10,14 +10,36 @@ MP_MODE = "Multiplayer"
 ALL_MODES = SP_MODES + (MP_MODE,)
 
 
+DEFAULT_ZOMBOID_ROOT = Path.home() / "Zomboid"
+
+
 def zomboid_root() -> Path:
-    """Return the user's ~/Zomboid directory."""
+    """Resolve the Zomboid data root, in priority order:
+      1. $PZ_HOME (explicit env override, only if the dir exists)
+      2. user-configured override saved by set_zomboid_root() — only read
+         from disk if a config file actually exists; never created here
+      3. ~/Zomboid (the platform default)
+
+    May return a path that does NOT exist on disk if none of the above
+    candidates resolved to an existing directory — call zomboid_root_exists()
+    if the caller needs to distinguish first-run vs. happy-path."""
     env = os.environ.get("PZ_HOME")
     if env:
         p = Path(env)
         if p.is_dir():
             return p
-    return Path.home() / "Zomboid"
+    # Lazy import keeps the config module untouched when there's no config.
+    from . import config as _cfg
+    if _cfg.config_exists():
+        p = _cfg.get_zomboid_root()
+        if p is not None:
+            return p
+    return DEFAULT_ZOMBOID_ROOT
+
+
+def zomboid_root_exists() -> bool:
+    """True iff zomboid_root() points at an existing directory."""
+    return zomboid_root().is_dir()
 
 
 def saves_root() -> Path:

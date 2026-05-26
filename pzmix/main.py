@@ -10,7 +10,7 @@ from pathlib import Path
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from pzmix import paths, saves as save_mod, compat, compose, backup, ui, steam, pzchar
+from pzmix import paths, saves as save_mod, compat, compose, backup, ui, steam, pzchar, config as cfg
 from pzmix.ui import (
     MenuItem, menu, multi_menu, header, hr, pause, clear, prompt_text, confirm,
     typed_confirm, tag_for_kind, fmt_wv,
@@ -831,25 +831,53 @@ def list_backups_flow() -> None:
 
 def settings_menu() -> None:
     while True:
+        # Show where the resolved root came from so the user understands
+        # which knob is in play.
+        env_set = bool(os.environ.get("PZ_HOME"))
+        configured = cfg.get_zomboid_root()
+        if env_set:
+            origin = f"{ACCENT}env var PZ_HOME{RESET}"
+        elif configured:
+            origin = f"{ACCENT}saved config{RESET} ({cfg.config_path()})"
+        elif paths.zomboid_root() == paths.DEFAULT_ZOMBOID_ROOT:
+            origin = f"{MUTED}default{RESET}"
+        else:
+            origin = f"{MUTED}fallback{RESET}"
+
         info = (
-            f"  {MUTED}Zomboid root :{RESET} {paths.zomboid_root()}\n"
+            f"  {MUTED}Zomboid root :{RESET} {paths.zomboid_root()}  "
+            f"{MUTED}[{RESET}{origin}{MUTED}]{RESET}\n"
             f"  {MUTED}Saves root   :{RESET} {paths.saves_root()}\n"
-            f"  {MUTED}Backups      :{RESET} {backup.backups_dir()}\n"
-            f"  {MUTED}override root with env var PZ_HOME{RESET}"
+            f"  {MUTED}Backups      :{RESET} {backup.backups_dir()}"
         )
         items = [
             MenuItem("Rescan saves",
                      hint="re-discover everything under the Zomboid root",
                      value="rescan"),
+            MenuItem("Change Zomboid root path",
+                     hint="prompts for a new path and persists it",
+                     value="changeroot"),
             MenuItem("Open backups folder",
                      hint=f"{backup.backups_dir()}",
                      value="openbackups"),
         ]
+        if configured:
+            items.append(MenuItem(
+                "Reset to default (~/Zomboid)",
+                hint="forgets the saved custom path",
+                value="resetroot"))
         ans = menu(["Main", "Settings & info"], items, status=info)
         if ans in (SENTINEL_BACK, SENTINEL_QUIT):
             return
         if ans == "rescan":
             STATE.refresh()
+        elif ans == "changeroot":
+            if _prompt_for_zomboid_root(current=paths.zomboid_root()):
+                STATE.refresh()
+        elif ans == "resetroot":
+            if confirm("forget custom path and use default?", default=False):
+                cfg.clear_zomboid_root()
+                STATE.refresh()
         elif ans == "openbackups":
             try:
                 os.startfile(backup.backups_dir())  # type: ignore[attr-defined]
@@ -857,9 +885,80 @@ def settings_menu() -> None:
                 print(f"  {WARN}could not open: {e}{RESET}"); pause()
 
 
+# ---------- first-run setup ----------
+
+def _prompt_for_zomboid_root(*, current: Path | None = None,
+                             first_run: bool = False) -> bool:
+    """Ask the user where their Zomboid data folder lives. Saves to the
+    persistent config on success (this is the only code path that writes
+    a config file). Returns True if a path was set, False if the user
+    cancelled."""
+    clear()
+    if first_run:
+        header(["First-run setup"])
+        print()
+        print(f"  {WARN}Project Zomboid data folder not found at the "
+              f"default location:{RESET}")
+        print(f"    {paths.DEFAULT_ZOMBOID_ROOT}")
+        print()
+        print(f"  {MUTED}This usually means one of:{RESET}")
+        print(f"    {MUTED}• You haven't launched Project Zomboid yet — it "
+              f"creates the folder on first launch. Run PZ once, then "
+              f"come back.{RESET}")
+        print(f"    {MUTED}• Your data lives in a non-standard location. "
+              f"Tell me where and I'll remember it for future runs.{RESET}")
+        print()
+    else:
+        header(["Main", "Settings & info", "Change Zomboid root"])
+        print()
+        print(f"  {MUTED}Current root:{RESET} {current}")
+        print()
+    print(f"  {MUTED}Enter the path to the Zomboid folder (containing "
+          f"Saves/, Server/, etc.). Empty input cancels.{RESET}")
+    print(hr())
+
+    while True:
+        try:
+            raw = input(f"  path » ").strip().strip('"').strip("'")
+        except (EOFError, KeyboardInterrupt):
+            return False
+        if not raw:
+            print(f"  {MUTED}cancelled.{RESET}")
+            return False
+        # ~ expansion + env vars
+        candidate = Path(os.path.expandvars(os.path.expanduser(raw)))
+        if not candidate.is_dir():
+            print(f"  {BAD}not a directory:{RESET} {candidate}")
+            print(f"  {MUTED}try again, or leave blank to cancel.{RESET}")
+            continue
+        # Soft hint when it doesn't look like a Zomboid folder, but still
+        # accept — could be a fresh path the user wants to set up.
+        if not any((candidate / sub).is_dir()
+                   for sub in ("Saves", "Server", "mods")):
+            if not confirm(
+                f"this folder has no Saves/, Server/, or mods/ subdir — "
+                f"use it anyway?",
+                default=False,
+            ):
+                continue
+        cfg.set_zomboid_root(candidate)
+        print(f"\n  {OK}✓ saved root → {candidate}{RESET}")
+        print(f"  {MUTED}stored in {cfg.config_path()}{RESET}")
+        pause()
+        return True
+
+
 # ---------- entry ----------
 
 def run() -> int:
+    # First-run path discovery: if neither the default ~/Zomboid nor a
+    # saved override resolves, ask the user. Skipped when $PZ_HOME points
+    # at something valid because that's an explicit, transient override.
+    if not paths.zomboid_root_exists():
+        if not _prompt_for_zomboid_root(first_run=True):
+            print(f"\n{MUTED}can't continue without a Zomboid folder. bye.{RESET}")
+            return 1
+
     try:
         main_menu()
     except KeyboardInterrupt:
